@@ -9,7 +9,7 @@ from pstats import Stats
 from random import uniform
 
 
-PLUGIN_VERSION = '4.3.0'
+PLUGIN_VERSION = '4.4.0'
 
 # profile
 def db(func):
@@ -157,11 +157,6 @@ class SkinTranslator(MPxFileTranslator):
                 riot_skl = SKL()
                 riot_skl.read(path2)
 
-        skl = SKL()
-        skl.dump(riot_skl)
-        skl.flip()
-        skl.write(dirname + '/' + basename.split('.skn')[0] + '.skl')
-
         # read riot.skn, path1 = riot_{same name}.skn > path2 = riot.skn
         riot_skn = None
         dirname, basename = MFPath.split(path)
@@ -175,8 +170,17 @@ class SkinTranslator(MPxFileTranslator):
                 riot_skn = SKN()
                 riot_skn.read(path2)
 
+        # skn.dump() fills skl.influences (the bound-bone table), so it must
+        # run before skl.write()
+        skl = SKL()
+        skl.dump(riot_skl)
+
         skn = SKN()
         skn.dump(skl, riot_skn)
+
+        skl.flip()
+        skl.write(dirname + '/' + basename.split('.skn')[0] + '.skl')
+
         skn.flip()
         skn.write(path)
         return True
@@ -1152,13 +1156,18 @@ class SKL:
 
             joint_count = len(self.joints)
 
+            # bound-bone table (joint indices); fall back to all joints
+            influences = self.influences if self.influences else list(
+                range(joint_count))
+            influence_count = len(influences)
+
             bs.write_uint16(0, joint_count)  # flags, joint count
-            bs.write_uint32(joint_count)  # influences
+            bs.write_uint32(influence_count)
 
             joints_offset = 64
             joint_indices_offset = joints_offset + joint_count * 100
             influences_offset = joint_indices_offset + joint_count * 8
-            joint_names_offset = influences_offset + joint_count * 2
+            joint_names_offset = influences_offset + influence_count * 2
 
             bs.write_int32(
                 joints_offset,
@@ -1201,9 +1210,8 @@ class SKL:
 
                 bs.write_int32(joint_offset[i] - bs.tell())
 
-            # influences v1: 0, 1, 2... -> len(joints)
             bs.seek(influences_offset)
-            bs.write_uint16(*[i for i in range(joint_count)])
+            bs.write_uint16(*influences)
 
             # joint indices
             bs.seek(joint_indices_offset)
@@ -1251,7 +1259,7 @@ class SKL:
             MGlobal.executeCommand(
                 f'attributeQuery -ex -n "{joint.name}" "riotid"', ptr)
             if util.getInt(ptr) == 0:
-                execmd += f'addAttr -ln "riotid" -nn "Riot ID" -at byte -min 0 -max 255 -dv {riot_id} "{joint.name}";'
+                execmd += f'addAttr -ln "riotid" -nn "Riot ID" -at long -min 0 -max 65535 -dv {riot_id} "{joint.name}";'
             execmd += f'setAttr {joint.name}.riotid {riot_id};'
             riot_id += 1
 
@@ -1425,15 +1433,15 @@ class SKL:
 
         # check limit joint
         joint_count = len(self.joints)
-        if joint_count > 256:
+        if joint_count > 65535:
             raise FunnyError(
-                f'[SKL.dump()]: Too many joints found: {joint_count}, max allowed: 256 joints.')
+                f'[SKL.dump()]: Too many joints found: {joint_count}, max allowed: 65535 joints.')
 
 
 # skn
 class SKNVertex:
     __slots__ = (
-        'position', 'influences', 'weights', 'normal', 'uv',
+        'position', 'influences', 'weights', 'normal', 'uv', 'color',
         'uv_index', 'new_index'
     )
 
@@ -1443,6 +1451,7 @@ class SKNVertex:
         self.weights = None
         self.normal = None
         self.uv = None
+        self.color = None  # 4 bytes (b, g, r, a), None = no vertex color
 
         # for dumping
         self.uv_index = None
@@ -1561,35 +1570,97 @@ class SKN:
                 vertex.uv = bs.read_vec2()
                 # 0: basic, 1: color, 2: tangent
                 if vertex_type >= 1:
-                    # pad 4 byte color
-                    bs.pad(4)
+                    vertex.color = bs.read_bytes(4)
                     if vertex_type == 2:
-                        # pad vec4 tangent
-                        bs.pad(16)
+                        bs.pad(16)  # tangent, recomputed by game
 
     def write(self, path):
+        # write v4 with vertex colors if present, else v1.1 basic
+        has_color = any(v.color != None for v in self.vertices)
+
         with open(path, 'wb') as f:
             bs = BinaryStream(f)
 
             bs.write_uint32(0x00112233)  # magic
-            bs.write_uint16(1, 1)  # major, minor
 
+            if not has_color:
+                bs.write_uint16(1, 1)  # major, minor
+                bs.write_uint32(len(self.submeshes))
+                for submesh in self.submeshes:
+                    bs.write_padded_ascii(64, submesh.name)
+                    bs.write_uint32(
+                        submesh.vertex_start, submesh.vertex_count, submesh.index_start, submesh.index_count)
+                bs.write_uint32(len(self.indices), len(self.vertices))
+                bs.write_uint16(*self.indices)
+                for vertex in self.vertices:
+                    bs.write_vec3(vertex.position)
+                    bs.write_bytes(vertex.influences)
+                    bs.write_float(*vertex.weights)
+                    bs.write_vec3(vertex.normal)
+                    bs.write_vec2(vertex.uv)
+                return
+
+            bs.write_uint16(4, 1)  # major, minor
             bs.write_uint32(len(self.submeshes))
             for submesh in self.submeshes:
                 bs.write_padded_ascii(64, submesh.name)
                 bs.write_uint32(
                     submesh.vertex_start, submesh.vertex_count, submesh.index_start, submesh.index_count)
-
+            bs.write_uint32(0)  # flags
             bs.write_uint32(len(self.indices), len(self.vertices))
+            bs.write_uint32(56)  # vertex size (color layout)
+            bs.write_uint32(1)  # vertex type: 1 = color
+
+            # bounding box + sphere
+            bb_min, bb_max = self.bounding_box()
+            bs.write_vec3(bb_min, bb_max)
+            central = Vector((bb_min.x + bb_max.x) / 2, (bb_min.y +
+                             bb_max.y) / 2, (bb_min.z + bb_max.z) / 2)
+            radius = sqrt((bb_max.x - central.x)**2 + (bb_max.y -
+                          central.y)**2 + (bb_max.z - central.z)**2)
+            bs.write_vec3(central)
+            bs.write_float(radius)
 
             bs.write_uint16(*self.indices)
 
+            white = bytes([255, 255, 255, 255])
             for vertex in self.vertices:
                 bs.write_vec3(vertex.position)
                 bs.write_bytes(vertex.influences)
                 bs.write_float(*vertex.weights)
                 bs.write_vec3(vertex.normal)
                 bs.write_vec2(vertex.uv)
+                bs.write_bytes(vertex.color if vertex.color != None else white)
+
+    def bounding_box(self):
+        bb_min = Vector(float('inf'), float('inf'), float('inf'))
+        bb_max = Vector(float('-inf'), float('-inf'), float('-inf'))
+        for vertex in self.vertices:
+            p = vertex.position
+            if p.x < bb_min.x: bb_min.x = p.x
+            if p.y < bb_min.y: bb_min.y = p.y
+            if p.z < bb_min.z: bb_min.z = p.z
+            if p.x > bb_max.x: bb_max.x = p.x
+            if p.y > bb_max.y: bb_max.y = p.y
+            if p.z > bb_max.z: bb_max.z = p.z
+        return bb_min, bb_max
+
+    @staticmethod
+    def apply_vertex_colors(mesh, vertices):
+        # vertex.color bytes are (b, g, r, a); map straight to MColor channels
+        if not any(v.color != None for v in vertices):
+            return
+        colors = MColorArray()
+        indices = MIntArray()
+        for i in range(len(vertices)):
+            c = vertices[i].color
+            if c != None:
+                colors.append(MColor(
+                    c[2] / 255.0, c[1] / 255.0, c[0] / 255.0, c[3] / 255.0))
+            else:
+                colors.append(MColor(1.0, 1.0, 1.0, 1.0))
+            indices.append(i)
+        mesh.setVertexColors(colors, indices)
 
     def load(self, skl=None, sepmat=False):
         def load_combined():
@@ -1626,6 +1697,8 @@ class SKN:
             mesh.assignUVs(
                 poly_count, poly_indices
             )
+
+            SKN.apply_vertex_colors(mesh, self.vertices)
 
             # name
             mesh.setName(f'{self.name}Shape')
@@ -1773,6 +1846,8 @@ class SKN:
                 mesh.assignUVs(
                     poly_count, poly_indices
                 )
+
+                SKN.apply_vertex_colors(mesh, shader_vertices[shader_index])
 
                 # save the MFnMesh to bind later
                 shader_meshes.append(mesh)
@@ -2040,6 +2115,7 @@ class SKN:
             mesh.getUVs(u_values, v_values)
             # iterator on vertices
             # to dump all new vertices base on unique uv
+            has_color = mesh.numColorSets() > 0
             bad_vertices = MIntArray()  # vertex has 4+ influences
             bad_vertices2 = MIntArray()  # vertex has no UVs
             iterator = MItMeshVertex(mesh_dagpath)
@@ -2086,6 +2162,20 @@ class SKN:
                 for i in range(normal_count):
                     normal += normals[i]
                 normal /= normal_count
+                # vertex color (b, g, r, a)
+                color = None
+                if has_color:
+                    try:
+                        vcolor = MColor()
+                        iterator.getColor(vcolor)
+                        color = bytes((
+                            max(0, min(255, int(round(vcolor.b * 255.0)))),
+                            max(0, min(255, int(round(vcolor.g * 255.0)))),
+                            max(0, min(255, int(round(vcolor.r * 255.0)))),
+                            max(0, min(255, int(round(vcolor.a * 255.0)))),
+                        ))
+                    except:
+                        color = None
                 # unique uv
                 uv_indices = MIntArray()
                 iterator.getUVIndices(uv_indices)
@@ -2110,9 +2200,11 @@ class SKN:
                                 position.x, position.y, position.z)
                             vertex.normal = Vector(
                                 normal.x, normal.y, normal.z)
-                            vertex.influences = bytes(influences)
+                            # raw joint indices; remapped to table bytes below
+                            vertex.influences = influences
                             vertex.weights = vertex_weights
                             vertex.uv = uv
+                            vertex.color = color
                             vertex.uv_index = uv_index
                             vertex.new_index = len(
                                 shader_vertices[shader_index])
@@ -2325,6 +2417,29 @@ class SKN:
 
             # assign new list
             self.submeshes = new_submeshes
+
+        # build influence table: per-vertex bytes index into it, so up to 256
+        # bound joints even though the skl holds up to 65535 joints
+        used_joints = set()
+        for vertex in self.vertices:
+            for j in range(4):
+                if vertex.weights[j] > 0:
+                    used_joints.add(vertex.influences[j])
+
+        influences = sorted(used_joints)
+        influence_count = len(influences)
+        if influence_count > 256:
+            raise FunnyError(
+                f'[SKN.dump()]: Too many bound joints found: {influence_count}, max allowed: 256 bound joints.\n'
+                'A skl may hold up to 65535 joints, but only 256 can be bound (have skin weights) at once.')
+
+        joint_to_influence = {joint: i for i, joint in enumerate(influences)}
+        for vertex in self.vertices:
+            vertex.influences = bytes(
+                joint_to_influence[vertex.influences[j]] if vertex.weights[j] > 0 else 0
+                for j in range(4)
+            )
+        skl.influences = influences
 
         # check limit vertices
         vertices_count = len(self.vertices)

@@ -58,7 +58,8 @@ An attempt to update RiotFileTranslator to Maya 2023.
         - To export: 
             - Combined mesh: select the bound mesh -> use export selection.
             - Group meshes: select the group of bound meshes -> use export selection.
-        - `33 22 11 00`: V1
+        - `33 22 11 00`: V1 (or V4 when the mesh has a vertex color set, to keep the color stream)
+        - Vertex colors: round-tripped losslessly. Imported as a color set; re-exported when present.
         - Limit vertices: 65535.
         - Show/select component on error: 
             - Vertex: 4+ influences vertex, material shared vertex, non UVs assigned vertex.
@@ -71,7 +72,7 @@ An attempt to update RiotFileTranslator to Maya 2023.
     - Write:
         - To export: will be exported with SKN.
         - `C3 4F FD 22`: V0 
-        - Limit joints: 256
+        - Limit joints: 65535 (max 256 of them may be bound/have skin weights)
         - New SKL data, no need to update/convert.
 4. ANM:
     - ANM data in Maya scene: 
