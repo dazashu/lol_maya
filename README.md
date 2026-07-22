@@ -3,9 +3,12 @@ An attempt to update RiotFileTranslator to Maya 2023.
 
 ![](https://i.imgur.com/cRpMpYt.gif)
 
-### This fork (4.4.0):
+### In my fork (4.4.0):
 - **Skeletons with more than 256 joints** now import and export correctly. A `.skl` may hold up to 65535 joints while up to 256 of them are bound (have skin weights). Export previously failed with `max allowed: 256 joints`.
 - **Vertex colors are preserved.** They are imported as a color set and written back on export (SKN v4) instead of being dropped.
+
+I will see to keep the plugin updated since tarn stopped supporting it and only work on lemon3d now.
+
 
 ### Installation:
 1. [Click here and download latest release.](https://github.com/dazashu/lol_maya/releases)
