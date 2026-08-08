@@ -3099,6 +3099,20 @@ class SO:
         # 2 - local origin locator and pivot
         self.scb_flag = 2
 
+    @staticmethod
+    def fix_material_name(material, so_name):
+        # maya node names are [A-Za-z0-9_] only and can not start with a digit,
+        # riot files can hold an empty or an illegal material name
+        if material == None:
+            material = ''
+        legal = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_'
+        material = ''.join(c if c in legal else '_' for c in material)
+        if material == '' or material.strip('_') == '':
+            return f'{so_name}_MAT'
+        if material[0] in '0123456789':
+            return 'numfix_'+material
+        return material
+
     def flip(self):
         for vertex in self.vertices:
             vertex.x = -vertex.x
@@ -3172,6 +3186,8 @@ class SO:
 
                 index += 1
 
+            self.material = SO.fix_material_name(self.material, self.name)
+
     def read_scb(self, path):
         with open(path, 'rb') as f:
             bs = BinaryStream(f)
@@ -3182,7 +3198,8 @@ class SO:
                     f'[SO.read_scb()]: Wrong file signature: {magic}')
 
             major, minor = bs.read_uint16(2)
-            if major not in (3, 2) and minor != 1:
+            # only major matters for the layout, minor 1 and 2 read the same
+            if major not in (2, 3):
                 raise FunnyError(
                     f'[SO.read_scb()]: Unsupported file version: {major}.{minor}')
 
@@ -3211,19 +3228,36 @@ class SO:
             # no pivot in scb
 
             for i in range(face_count):
+                # a face is always 12 + 64 + 24 bytes, read it whole before
+                # deciding to skip it, or the stream desyncs and every
+                # following face is garbage
                 face = bs.read_uint32(3)
+                material = bs.read_padded_ascii(64)
+                uvs = bs.read_float(6)
+
+                # skip bad faces
                 if face[0] == face[1] or face[1] == face[2] or face[2] == face[0]:
                     continue
+                # skip faces pointing outside the vertex buffer,
+                # MFnMesh.create() crashes maya on those
+                if face[0] >= vertex_count or face[1] >= vertex_count or face[2] >= vertex_count:
+                    continue
+
                 self.indices.extend(face)
-
-                self.material = bs.read_padded_ascii(64)
-
-                uvs = bs.read_float(6)
+                self.material = material
 
                 # u u u, v v v
                 self.uvs.append(Vector(uvs[0], uvs[3]))
                 self.uvs.append(Vector(uvs[1], uvs[4]))
                 self.uvs.append(Vector(uvs[2], uvs[5]))
+
+            if len(self.indices) == 0:
+                raise FunnyError(
+                    f'[SO.read_scb()]: No usable face in this file: {face_count} faces, all bad.')
+
+            # scb 3.2 stores an empty material name on every face,
+            # maya can not create a shader with an empty/illegal name
+            self.material = SO.fix_material_name(self.material, self.name)
 
     def write_sco(self, path):
         with open(path, 'w') as f:

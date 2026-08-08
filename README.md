@@ -3,9 +3,12 @@ An attempt to update RiotFileTranslator to Maya 2023.
 
 ![](https://i.imgur.com/cRpMpYt.gif)
 
-### In my fork (4.4.0):
+### In my fork (4.4.1):
 - **Skeletons with more than 256 joints** now import and export correctly. A `.skl` may hold up to 65535 joints while up to 256 of them are bound (have skin weights). Export previously failed with `max allowed: 256 joints`.
 - **Vertex colors are preserved.** They are imported as a color set and written back on export (SKN v4) instead of being dropped.
+- **SCB files with an empty material name now import.** SCB v3.2 stores an empty material name on every face, and Maya refuses to create a shader with an empty name, so the import failed. The material now falls back to `{file name}_MAT`, and illegal characters or a leading digit in a material name are fixed instead of breaking the import.
+- **SCB faces are no longer misread after a degenerate face.** The reader skipped a bad face without consuming its material and UV bytes, which desynced the stream and turned every following face into garbage.
+- **SCB version check fixed.** The old test `major not in (3, 2) and minor != 1` could never be true, so an unsupported file was never reported. Faces indexing outside the vertex buffer are now dropped as well, instead of crashing Maya inside `MFnMesh.create()`.
 
 I will see to keep the plugin updated since tarn stopped supporting it and only work on lemon3d now.
 
