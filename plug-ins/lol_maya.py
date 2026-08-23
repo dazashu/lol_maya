@@ -1632,6 +1632,14 @@ class SKN:
                 bs.write_vec2(vertex.uv)
                 bs.write_bytes(vertex.color if vertex.color != None else white)
 
+            # THE 12-BYTE END TAB. Every real v4 .skn ends with twelve zero bytes after the
+            # vertex buffer - checked on riven_skin23.skn, riven_skin23_spell2_demon.skn and
+            # graves.skn straight out of the game's wads, all three, all zero. This branch never
+            # wrote it, so a v4 export came out exactly 12 bytes short of what the game reads and
+            # the client crashed on load. The v1.1 branch above is unaffected: those files have no
+            # end tab, which is why this only ever bit meshes that carry vertex colours.
+            bs.write_bytes(bytes(12))
+
     def bounding_box(self):
         bb_min = Vector(float('inf'), float('inf'), float('inf'))
         bb_max = Vector(float('-inf'), float('-inf'), float('-inf'))
