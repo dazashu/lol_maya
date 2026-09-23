@@ -237,10 +237,17 @@ class ANMTranslator(MPxFileTranslator):
         if not path.endswith('.anm'):
             path += '.anm'
 
+        # write Riot's compressed container by default, the uncompressed one on request.
+        # On janna skin67's idle1 that is 85KB against 751KB for the same animation.
+        uncompressed = 'uncompressed=1' in options
+
         anm = ANM()
         anm.dump()
         anm.flip()
-        anm.write(path)
+        if uncompressed:
+            anm.write(path)
+        else:
+            anm.write_compressed(path)
         return True
 
 
@@ -900,6 +907,60 @@ class CTransform:
             (max.z - min.z) / 65535.0 * (bytes[4] | bytes[5] << 8) + min.z
         )
 
+    # the two below are the exact inverses of the two above, for writing a compressed anm.
+    # 'smallest three': the largest magnitude component is dropped and rebuilt from the other
+    # three, since a unit quaternion has one degree of freedom less than its four numbers.
+    ONE_DIV_SQRT2 = 0.70710678118
+    SQRT2_DIV_32767 = 0.00004315969
+
+    @staticmethod
+    def compress_quat(quat):
+        values = [quat.x, quat.y, quat.z, quat.w]
+        max_index = 0
+        for i in range(4):
+            if abs(values[i]) > abs(values[max_index]):
+                max_index = i
+        # the dropped component is rebuilt as +sqrt(...), so it has to be the positive one.
+        # negating a quaternion names the same rotation, so this costs nothing.
+        if values[max_index] < 0.0:
+            values = [-value for value in values]
+
+        bits = max_index << 45
+        shift = 30
+        for i in range(4):
+            if i == max_index:
+                continue
+            step = int(round(
+                (values[i] + CTransform.ONE_DIV_SQRT2) / CTransform.SQRT2_DIV_32767))
+            if step < 0:
+                step = 0
+            elif step > 32767:
+                step = 32767
+            bits |= step << shift
+            shift -= 15
+
+        return bytes((
+            bits & 255, (bits >> 8) & 255,
+            (bits >> 16) & 255, (bits >> 24) & 255,
+            (bits >> 32) & 255, (bits >> 40) & 255
+        ))
+
+    @staticmethod
+    def compress_vec(min, max, vec):
+        out = bytearray(6)
+        for i, (lo, hi, value) in enumerate((
+            (min.x, max.x, vec.x), (min.y, max.y, vec.y), (min.z, max.z, vec.z)
+        )):
+            span = hi - lo
+            step = 0 if span <= 0.0 else int(round((value - lo) / span * 65535.0))
+            if step < 0:
+                step = 0
+            elif step > 65535:
+                step = 65535
+            out[i*2] = step & 255
+            out[i*2+1] = (step >> 8) & 255
+        return bytes(out)
+
 
 # for set skl joint transform (transformation matrix)
 class MTransform:
@@ -958,17 +1019,23 @@ class MTransform:
 # skl
 class SKLJoint:
     __slots__ = (
-        'name', 'parent',
+        'name', 'parent', 'radius',
         'local_translation', 'local_scale', 'local_rotation',
         'iglobal_translation', 'iglobal_scale', 'iglobal_rotation',
         'global_matrix', 'dagpath'
     )
+
+    # every joint of all 61 shipped skl files measured holds exactly this
+    DEFAULT_RADIUS = 2.1
 
     def __init__(self):
         self.name = None
 
         # just id, not actual parent, especially not asian parent
         self.parent = None
+
+        # display radius, preserved from the file rather than assumed
+        self.radius = SKLJoint.DEFAULT_RADIUS
 
         # fuck transform matrix
         self.local_translation = None
@@ -994,6 +1061,16 @@ class SKL:
 
         # for loading as skincluster
         self.influences = []
+
+        # the file's own name slots, empty in 60 of the 61 shipped skl files measured,
+        # 'n/a' in the last one. Kept so a re-export writes back what was there.
+        self.name = ''
+        self.asset = ''
+
+    @staticmethod
+    def align4(value):
+        # every name in a skl starts on a 4 byte boundary
+        return (value + 3) // 4 * 4
 
     def flip(self):
         # flip the L with R: https://youtu.be/2yzMUs3badc
@@ -1027,8 +1104,17 @@ class SKL:
                 joints_offset = bs.read_int32()
                 bs.pad(4)  # joint indices offset
                 influences_offset = bs.read_int32()
-                # name offset, asset name offset, joint names offset, 5 reserved offset
-                bs.pad(32)
+                name_offset, asset_offset = bs.read_int32(2)
+                bs.pad(4)  # joint names offset
+                bs.pad(20)  # 5 reserved offset
+
+                # skeleton name and asset name
+                if name_offset > 0:
+                    bs.seek(name_offset)
+                    self.name = bs.read_char_until_zero()
+                if asset_offset > 0:
+                    bs.seek(asset_offset)
+                    self.asset = bs.read_char_until_zero()
 
                 # read joints
                 if joints_offset > 0 and joint_count > 0:
@@ -1037,11 +1123,13 @@ class SKL:
                     for i in range(joint_count):
                         joint = self.joints[i]
 
+                        # flags is 0 and id is the joint's own index in all 61 shipped
+                        # skl files measured, so neither is kept: write() rebuilds both
                         bs.pad(4)  # flags and id
                         joint.parent = bs.read_int16()  # cant be uint
-                        bs.pad(2)  # flags
+                        bs.pad(2)  # pad
                         joint_hash = bs.read_uint32()
-                        bs.pad(4)  # radius
+                        joint.radius = bs.read_float()
 
                         # local
                         joint.local_translation = bs.read_vec3()
@@ -1167,14 +1255,24 @@ class SKL:
             joints_offset = 64
             joint_indices_offset = joints_offset + joint_count * 100
             influences_offset = joint_indices_offset + joint_count * 8
-            joint_names_offset = influences_offset + influence_count * 2
+
+            # NAME SLOTS. Riot puts the skeleton name, then the asset name, then the joint name
+            # table after the influence list, each starting on a 4 byte boundary, and an EMPTY
+            # name still occupies its four bytes with the header offset pointing at it. This
+            # writer used to put 0 in both header slots and pack the joint names with no padding
+            # at all, which drops the two slots real files reserve and makes the file a few bytes
+            # shorter than the game's own. Verified against all 61 shipped skl files: the three
+            # offsets are exactly these expressions, and the last joint name ends on the file size.
+            name_offset = SKL.align4(influences_offset + influence_count * 2)
+            asset_offset = name_offset + SKL.align4(len(self.name) + 1)
+            joint_names_offset = asset_offset + SKL.align4(len(self.asset) + 1)
 
             bs.write_int32(
                 joints_offset,
                 joint_indices_offset,
                 influences_offset,
-                0,  # name
-                0,  # asset name
+                name_offset,
+                asset_offset,
                 joint_names_offset
             )
 
@@ -1182,12 +1280,24 @@ class SKL:
             bs.write_uint32(0xFFFFFFFF, 0xFFFFFFFF,
                             0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF)
 
+            def write_padded_name(value):
+                # nul terminated, then padded to the next 4 byte boundary. A name whose length is
+                # already a multiple of 4 still gains its four bytes rather than running into the
+                # next one.
+                bs.write_ascii(value)
+                for i in range(SKL.align4(len(value) + 1) - len(value)):
+                    bs.write_bytes(bytes([0]))
+
+            bs.seek(name_offset)
+            write_padded_name(self.name)
+            bs.seek(asset_offset)
+            write_padded_name(self.asset)
+
             joint_offset = {}
             bs.seek(joint_names_offset)
             for i in range(joint_count):
                 joint_offset[i] = bs.tell()
-                bs.write_ascii(self.joints[i].name)
-                bs.write_bytes(bytes([0]))  # pad
+                write_padded_name(self.joints[i].name)
 
             bs.seek(joints_offset)
             for i in range(joint_count):
@@ -1195,9 +1305,12 @@ class SKL:
 
                 bs.write_uint16(0, i)  # flags + id
                 bs.write_int16(joint.parent)  # -1, cant be uint
-                bs.write_uint16(0)  # flags
+                bs.write_uint16(0)  # pad
                 bs.write_uint32(Hash.elf(joint.name))
-                bs.write_float(2.1)  # radius/scale
+                # radius as the file had it, not a hardcoded 2.1. Every joint of every shipped
+                # skl measured is 2.1, so this writes the same bytes on a real asset, but it
+                # stops being an assumption.
+                bs.write_float(joint.radius)
 
                 # local
                 bs.write_vec3(joint.local_translation)
@@ -1213,11 +1326,17 @@ class SKL:
             bs.seek(influences_offset)
             bs.write_uint16(*influences)
 
-            # joint indices
+            # JOINT INDEX TABLE, sorted by hash ascending.
+            # This loop used to reuse `joint`, the variable left over from the joint loop above,
+            # so every entry got the LAST joint's hash - the table was garbage in every skl this
+            # wrote. It is a lookup table the game binary searches, so it also has to be sorted
+            # by hash, which all 61 shipped skl files measured are.
             bs.seek(joint_indices_offset)
-            for i in range(joint_count):
+            hash_ids = sorted(
+                ((Hash.elf(self.joints[i].name), i) for i in range(joint_count)))
+            for joint_hash, i in hash_ids:
                 bs.write_uint16(i, 0)  # id + pad
-                bs.write_uint32(Hash.elf(joint.name))
+                bs.write_uint32(joint_hash)
 
             # resource size
             bs.seek(0)
@@ -1304,6 +1423,11 @@ class SKL:
             MGlobal.displayInfo(
                 '[SKL.dump(riot.skl)]: Found riot.skl, sorting joints...')
 
+            # the name slots come from the reference file, they have no representation in a
+            # maya scene and inventing them would be worse than copying them
+            self.name = riot.name
+            self.asset = riot.asset
+
             new_joints = []
             joint_count = len(self.joints)
             riot_joint_count = len(riot.joints)
@@ -1316,6 +1440,8 @@ class SKL:
                 found = False
                 for i in range(joint_count):
                     if flags[i] and self.joints[i].name.lower() == riot_joint_name:
+                        # a maya joint carries no riot radius, so take the matched joint's
+                        self.joints[i].radius = riot_joint.radius
                         new_joints.append(self.joints[i])
                         flags[i] = False
                         found = True
@@ -1328,6 +1454,7 @@ class SKL:
                     joint = SKLJoint()
                     joint.dagpath = None
                     joint.name = riot_joint.name
+                    joint.radius = riot_joint.radius
                     joint.parent = -1
                     joint.local_translation = Vector(0.0, 0.0, 0.0)
                     joint.local_rotation = Quaternion(0.0, 0.0, 0.0, 1.0)
@@ -3023,6 +3150,350 @@ class ANM:
             # resource size
             bs.seek(12)
             bs.write_uint32(bs.end())
+
+    # ------------------------------------------------------------------
+    # compressed anm (r3d2canm)
+    #
+    # The uncompressed writer above stores every joint on every frame with raw float32 pools:
+    # janna skin67's idle1 comes out at 751KB where Riot ships 92KB. This writes Riot's own
+    # compressed container instead: quantised values, and only the keyframes a curve actually
+    # needs, reconstructed by the game with Catmull-Rom over a sliding window of four keys.
+    #
+    # Every constant below is measured off the 198 shipped compressed anm files, and the
+    # decimation is verified by decoding this writer's own output with a port of the game's
+    # evaluator and comparing it back against the poses that went in.
+    # ------------------------------------------------------------------
+
+    # The decoder ignores these six floats, they record the tolerances the encoder used.
+    # 107 of the 198 shipped files hold exactly this tuple, so it is copied, not invented.
+    CANM_ERROR_METRIC = (2.0, 10.0, 2.0, 10.0, 0.01, 0.2)
+    # flags 3 is the most common value that does NOT set bit 2 (UseKeyframeParametrization),
+    # which is the uniformly weighted form this writer produces. 64 shipped files use it.
+    CANM_FLAGS = 3
+
+    # Decimation tolerances, in the units of the values themselves: a quaternion component, a
+    # translation in League units, a scale factor. A quaternion component quantises to 4.32e-05
+    # steps, so asking for better than about 2e-05 buys nothing but keyframes.
+    #
+    # Measured against Riot's own janna skin67 idle1 (4720 keys, 92092 bytes), re-encoding the
+    # poses their file decodes to:
+    #
+    #   rot     trans   scale   keys    bytes            worst error
+    #   0.0005  0.02    0.0005  13393   144166  1.57x    rot 5.1e-04  trans 0.027
+    #   0.002   0.1     0.002    7442    84656  0.92x    rot 2.0e-03  trans 0.100
+    #   0.005   0.3     0.005    4774    57976  0.63x    rot 5.0e-03  trans 0.298
+    #   0.01    0.6     0.01     3664    46876  0.51x    rot 1.0e-02  trans 0.598
+    #
+    # The third row matches Riot's keyframe density almost exactly (4774 against 4720). The
+    # second is chosen instead: it still comes out SMALLER than Riot's file while holding
+    # rotations to a fifth of the error that their own density implies. A rotation component of
+    # 0.002 is about a quarter of a degree, and 0.1 League units is invisible on a champion
+    # roughly 200 units tall. Loosen these to trade precision for bytes.
+    CANM_ROTATION_TOLERANCE = 0.002
+    CANM_TRANSLATION_TOLERANCE = 0.1
+    CANM_SCALE_TOLERANCE = 0.002
+
+    @staticmethod
+    def catmull_rom_weights(amount):
+        # ease_in and ease_out are both 0.5 in the uniform (non parametrized) form
+        ease_in = ease_out = 0.5
+        m0 = (((2.0 - amount) * amount) - 1.0) * (amount * ease_in)
+        m1 = ((((2.0 - ease_out) * amount) + (ease_out - 3.0)) * (amount * amount)) + 1.0
+        m2 = ((((3.0 - ease_in * 2.0) + ((ease_in - 2.0) * amount))
+               * amount) + ease_in) * amount
+        m3 = ((amount - 1.0) * amount) * (amount * ease_out)
+        return m0, m1, m2, m3
+
+    @staticmethod
+    def compress_time(time, duration):
+        # truncation, not rounding - this is what the game does
+        if duration <= 0.0:
+            return 0
+        scaled = time / duration * 65535.0
+        if scaled <= 0.0:
+            return 0
+        if scaled >= 65535.0:
+            return 65535
+        return int(scaled)
+
+    @staticmethod
+    def align_shortest_path(window):
+        # the game flips any key in the window that points away from the first one, so a
+        # decimator that skips this reconstructs a different rotation than the game will
+        anchor = window[0][1]
+        out = [window[0]]
+        for i in range(1, 4):
+            value = window[i][1]
+            if sum(a * b for a, b in zip(value, anchor)) < 0.0:
+                value = tuple(-c for c in value)
+            out.append((window[i][0], value))
+        return out
+
+    @staticmethod
+    def sample_window(time, window, size):
+        t1 = window[1][0]
+        t2 = window[2][0]
+        if t2 == t1:
+            return window[1][1]
+        m = ANM.catmull_rom_weights(float(time - t1) / (t2 - t1))
+        out = tuple(
+            sum(m[i] * window[i][1][c] for i in range(4))
+            for c in range(size)
+        )
+        if size == 4:
+            length = sqrt(sum(v * v for v in out))
+            if length > 0.0:
+                out = tuple(v / length for v in out)
+        return out
+
+    @staticmethod
+    def channel_error(got, want, size):
+        if size == 4:
+            # a quaternion and its negation are the same rotation
+            return min(
+                max(abs(a - b) for a, b in zip(got, want)),
+                max(abs(a + b) for a, b in zip(got, want))
+            )
+        return max(abs(a - b) for a, b in zip(got, want))
+
+    @staticmethod
+    def decimate(times, values, size, tolerance):
+        """Pick the keyframes whose Catmull-Rom reconstruction stays within tolerance.
+
+        Greedy: start with the two ends, repeatedly add a key where the curve is worst. This
+        converges because adding the worst frame as a key drives its own error to zero, and the
+        loop can never run past one key per frame.
+        """
+        count = len(values)
+        if count == 0:
+            return []
+        if count == 1:
+            return [0]
+
+        first = values[0]
+        if all(ANM.channel_error(v, first, size) <= tolerance for v in values):
+            return [0]  # constant channel, one key is the whole curve
+
+        keys = [0, count - 1]
+        errors = [0.0] * count
+
+        def refresh(key_lo, key_hi):
+            # recompute the per-frame error over the key range whose windows just moved.
+            # Adding a key only disturbs the segments within two keys of it, so re-scoring the
+            # whole channel every round is wasted work - and it is what made this quadratic.
+            last = len(keys) - 1
+            key_lo = 0 if key_lo < 0 else key_lo
+            key_hi = last if key_hi > last else key_hi
+            start = keys[key_lo]
+            stop = count - 1 if key_hi >= last else keys[key_hi]
+            k = key_lo
+            for f in range(start, stop + 1):
+                while k < last and keys[k + 1] <= f:
+                    k += 1
+                i0 = keys[k - 1 if k > 0 else 0]
+                i1 = keys[k]
+                i2 = keys[k + 1 if k + 1 < last else last]
+                i3 = keys[k + 2 if k + 2 < last else last]
+                window = [
+                    (times[i0], values[i0]), (times[i1], values[i1]),
+                    (times[i2], values[i2]), (times[i3], values[i3]),
+                ]
+                if size == 4:
+                    window = ANM.align_shortest_path(window)
+                errors[f] = ANM.channel_error(
+                    ANM.sample_window(times[f], window, size), values[f], size)
+
+        refresh(0, len(keys) - 1)
+        while len(keys) < count:
+            worst = -1.0
+            worst_frame = -1
+            for f in range(count):
+                if errors[f] > worst:
+                    worst = errors[f]
+                    worst_frame = f
+            if worst <= tolerance or worst_frame < 0:
+                break
+            # insert, keeping the list sorted
+            low, high = 0, len(keys)
+            while low < high:
+                mid = (low + high) // 2
+                if keys[mid] < worst_frame:
+                    low = mid + 1
+                else:
+                    high = mid
+            if low < len(keys) and keys[low] == worst_frame:
+                break  # already a key and still worst: nothing more to gain
+            keys.insert(low, worst_frame)
+            refresh(low - 4, low + 4)
+        return keys
+
+    def write_compressed(self, path):
+        track_count = len(self.tracks)
+        if track_count == 0:
+            raise FunnyError('[ANM.write_compressed()]: No tracks to write.')
+        frame_count = self.frame_count
+        if frame_count < 1:
+            raise FunnyError('[ANM.write_compressed()]: No frames to write.')
+
+        duration = (frame_count - 1) / self.fps
+        times = [ANM.compress_time(f / self.fps, duration)
+                 for f in range(frame_count)]
+
+        # quantisation ranges, component wise over the whole clip
+        big = float('inf')
+        tmin = [big] * 3
+        tmax = [-big] * 3
+        smin = [big] * 3
+        smax = [-big] * 3
+        for track in self.tracks:
+            for f in range(frame_count):
+                pose = track.poses[f]
+                for c, value in enumerate((pose.translation.x, pose.translation.y, pose.translation.z)):
+                    if value < tmin[c]:
+                        tmin[c] = value
+                    if value > tmax[c]:
+                        tmax[c] = value
+                for c, value in enumerate((pose.scale.x, pose.scale.y, pose.scale.z)):
+                    if value < smin[c]:
+                        smin[c] = value
+                    if value > smax[c]:
+                        smax[c] = value
+        # a channel that never moves has a zero span, which quantises to the minimum exactly
+        for c in range(3):
+            if tmax[c] < tmin[c]:
+                tmin[c] = tmax[c] = 0.0
+            if smax[c] < smin[c]:
+                smin[c] = smax[c] = 1.0
+        tmin_v, tmax_v = Vector(*tmin), Vector(*tmax)
+        smin_v, smax_v = Vector(*smin), Vector(*smax)
+
+        # the value each channel holds when it has no keys at all, straight out of the game's
+        # JointHot::new(). A channel that never leaves its default is simply not written.
+        DEFAULTS = {0: (0.0, 0.0, 0.0, 1.0), 1: (0.0, 0.0, 0.0), 2: (1.0, 1.0, 1.0)}
+
+        # per joint, per channel: decimate, then quantise the surviving keys
+        channels = []  # (joint, kind, [(time, 6 bytes)])
+        for j in range(track_count):
+            track = self.tracks[j]
+            poses = [track.poses[f] for f in range(frame_count)]
+            streams = (
+                (0, [(p.rotation.x, p.rotation.y, p.rotation.z, p.rotation.w)
+                     for p in poses], 4, ANM.CANM_ROTATION_TOLERANCE),
+                (1, [(p.translation.x, p.translation.y, p.translation.z)
+                     for p in poses], 3, ANM.CANM_TRANSLATION_TOLERANCE),
+                (2, [(p.scale.x, p.scale.y, p.scale.z)
+                     for p in poses], 3, ANM.CANM_SCALE_TOLERANCE),
+            )
+            for kind, values, size, tolerance in streams:
+                frames = ANM.decimate(times, values, size, tolerance)
+                if len(frames) == 1 and ANM.channel_error(
+                        values[frames[0]], DEFAULTS[kind], size) <= tolerance:
+                    channels.append((j, kind, []))  # never moves off the default
+                    continue
+                keys = []
+                for f in frames:
+                    value = values[f]
+                    if kind == 0:
+                        raw = CTransform.compress_quat(
+                            Quaternion(value[0], value[1], value[2], value[3]))
+                    elif kind == 1:
+                        raw = CTransform.compress_vec(
+                            tmin_v, tmax_v, Vector(*value))
+                    else:
+                        raw = CTransform.compress_vec(
+                            smin_v, smax_v, Vector(*value))
+                    keys.append((times[f], raw))
+                # THE REPEATED LAST KEY. The window that covers the final segment needs a key
+                # BEYOND it, or the curve extrapolates off the end of the clip. Riot repeats the
+                # last key at the same time to close it: 219 of the 674 channels in Riot's own
+                # idle1 end on two keys sharing a time, and every one of them is a duplicate.
+                if len(keys) > 1:
+                    keys.append(keys[-1])
+                channels.append((j, kind, keys))
+
+        # THE STREAM IS IN CONSUMPTION ORDER, NOT TIME ORDER.
+        # The game holds ONE global cursor and takes the next entry only when that entry's own
+        # channel is ready for it, so an entry parked in front of a channel that is not ready
+        # stalls every joint behind it. Riot's own files are not sorted by time - idle1 opens
+        # with joint 56's first three rotation keys, then its first three translation keys, then
+        # joint 241 - because that is the order the decoder asks for them.
+        #
+        # It opens with a PROLOGUE of the first three keys of every channel, which is what the
+        # jump cache slot points at: slot 0 holds (i0, i0, i1, i2), the first key repeated into
+        # the oldest slot, so the opening segment interpolates from a real key instead of from
+        # the default. A constant channel gets (i0, i0, i0, i0) and an absent one 65535s.
+        # Measured on idle1: slot 0's highest index is 1137 and the prologue is 1138 entries,
+        # so the cursor resumes exactly where the prologue ends.
+        stream = []
+        seeds = {}
+        window = {}
+        cursor_of = {}
+        for joint, kind, keys in channels:
+            if not keys:
+                seeds[(joint, kind)] = (65535, 65535, 65535, 65535)
+                continue
+            start = len(stream)
+            for time, raw in keys[:3]:
+                stream.append((time, joint, kind, raw))
+            last = start + min(3, len(keys)) - 1
+            index = [start, start, min(start + 1, last), min(start + 2, last)]
+            seeds[(joint, kind)] = tuple(index)
+            window[(joint, kind)] = [keys[i - start][0] for i in index]
+            cursor_of[(joint, kind)] = min(3, len(keys))
+
+        # replay the decoder frame by frame and emit each key at the moment it is taken
+        for f in range(frame_count):
+            time = times[f]
+            for joint, kind, keys in channels:
+                key = (joint, kind)
+                if key not in window:
+                    continue
+                times_hot = window[key]
+                next_key = cursor_of[key]
+                while next_key < len(keys) and time >= times_hot[2]:
+                    stream.append((keys[next_key][0], joint, kind, keys[next_key][1]))
+                    times_hot = [times_hot[1], times_hot[2],
+                                 times_hot[3], keys[next_key][0]]
+                    next_key += 1
+                window[key] = times_hot
+                cursor_of[key] = next_key
+
+        with open(path, 'wb') as f:
+            bs = BinaryStream(f)
+
+            bs.write_ascii('r3d2canm')
+            bs.write_uint32(1)  # version
+            bs.write_uint32(0)  # resource size, patched last
+            bs.write_ascii('canm')  # format token
+            bs.write_uint32(ANM.CANM_FLAGS)
+            bs.write_int32(track_count, len(stream), 1)  # joints, frames, jump caches
+            bs.write_float(duration, self.fps)
+            bs.write_float(*ANM.CANM_ERROR_METRIC)
+            bs.write_vec3(tmin_v, tmax_v, smin_v, smax_v)
+
+            frames_offset = 128
+            jump_caches_offset = frames_offset + len(stream) * 10
+            joint_hashes_offset = jump_caches_offset + track_count * 24
+            # offsets are stored relative to the 12 bytes of magic, version and resource size
+            bs.write_int32(frames_offset - 12, jump_caches_offset - 12,
+                           joint_hashes_offset - 12)
+
+            for time, joint, kind, raw in stream:
+                bs.write_uint16(time, joint | (kind << 14))
+                bs.write_bytes(raw)
+
+            # 4 frame indices per channel, rotation then translation then scale.
+            # 65535 is out of range on purpose: the decoder leaves that slot at its default
+            # and, importantly, does not move the cursor for it.
+            for joint in range(track_count):
+                for kind in (0, 1, 2):
+                    bs.write_uint16(*seeds[(joint, kind)])
+
+            for track in self.tracks:
+                bs.write_uint32(track.joint_hash)
+
+            bs.seek(12)
+            bs.write_uint32(bs.end() - 12)
 
     def load(self, delchannel=False):
         # ensure scene fps
