@@ -1481,6 +1481,10 @@ class SKN:
         self.indices = []
         self.vertices = []
         self.submeshes = []
+        # major 4 header flags, see read()
+        self.flags = 0
+        # per-submesh influence palettes, see dump()
+        self.skinning_block = b''
 
         # for loading
         self.name = None
@@ -1534,7 +1538,12 @@ class SKN:
                         4)
 
                 if major == 4:
-                    bs.pad(4)  # flags
+                    # flags, bit 0: a skinning palette block sits between the header and the
+                    # index buffer, bit 1: indices are relative to their submesh's vertex_start.
+                    # Riot started setting both on newer skins (janna skin67 is flags 3); a file
+                    # that has them was read as garbage before, because the palette block was
+                    # eaten as indices and every index then pointed at the wrong vertex.
+                    self.flags = bs.read_uint32()
 
                 index_count, vertex_count = bs.read_uint32(2)
 
@@ -1551,13 +1560,72 @@ class SKN:
                 raise FunnyError(
                     f'[SKN.read()]: Bad indices data: {index_count}')
 
-            # read indices by face
-            face_count = index_count // 3
-            for i in range(face_count):
-                face = bs.read_uint16(3)
-                # check dupe index in a face
-                if not (face[0] == face[1] or face[1] == face[2] or face[2] == face[0]):
-                    self.indices.extend(face)
+            # skinning palettes (flags bit 0)
+            # a submesh whose weights reach past influence 255 cannot say so in the single byte a
+            # vertex has, so the file gives that submesh its own table: the byte is an index into
+            # the table and the table holds the real uint16 influence. janna skin67 has 297
+            # influences and three such submeshes (Skirt, Metal03, Wing).
+            # layout: uint16 block size, then records of
+            #   uint8 submesh index, high bit set on the last record
+            #   uint8 entry count
+            #   uint16 entry * count
+            palettes = {}
+            if self.flags & 1:
+                block = bs.read_bytes(bs.read_uint16())
+                offset = 0
+                while offset < len(block):
+                    if offset + 2 > len(block):
+                        raise FunnyError(
+                            '[SKN.read()]: Truncated skinning palette block.')
+                    submesh_index = block[offset] & 127
+                    entry_count = block[offset+1]
+                    offset += 2
+                    if (submesh_index >= len(self.submeshes) or entry_count == 0
+                            or offset + entry_count * 2 > len(block)):
+                        raise FunnyError(
+                            '[SKN.read()]: Bad skinning palette block.')
+                    palettes[submesh_index] = Struct(f'{entry_count}H').unpack(
+                        block[offset:offset+entry_count*2])
+                    offset += entry_count * 2
+
+            # read indices
+            # walked submesh by submesh, not as one flat run, because bit 1 of the flags makes
+            # each index relative to its own submesh's vertex_start. Dropping a degenerate face
+            # also shifts every following submesh, so index_start/index_count are rebuilt here -
+            # the old flat loop dropped faces without touching them, which silently slid every
+            # material onto the wrong faces.
+            raw_indices = bs.read_uint16(
+                index_count, True) if index_count > 0 else ()
+            tiled = sorted(
+                (submesh.index_start, submesh.index_count) for submesh in self.submeshes)
+            covered = 0
+            for start, count in tiled:
+                if start != covered:
+                    break
+                covered += count
+            if covered != index_count:
+                if self.flags & 2:
+                    raise FunnyError(
+                        '[SKN.read()]: Submeshes do not cover the index buffer, '
+                        'cannot resolve submesh relative indices.')
+                # not a tiling, so there is nothing to rebase: keep the flat read
+                for i in range(0, index_count, 3):
+                    face = raw_indices[i:i+3]
+                    if not (face[0] == face[1] or face[1] == face[2] or face[2] == face[0]):
+                        self.indices.extend(face)
+            else:
+                for submesh in self.submeshes:
+                    start = len(self.indices)
+                    offset = submesh.vertex_start if self.flags & 2 else 0
+                    for i in range(submesh.index_start, submesh.index_start + submesh.index_count, 3):
+                        face = (raw_indices[i] + offset, raw_indices[i+1] +
+                                offset, raw_indices[i+2] + offset)
+                        # check dupe index in a face
+                        if face[0] == face[1] or face[1] == face[2] or face[2] == face[0]:
+                            continue
+                        self.indices.extend(face)
+                    submesh.index_start = start
+                    submesh.index_count = len(self.indices) - start
 
             # read vertices
             self.vertices = [SKNVertex() for i in range(vertex_count)]
@@ -1574,6 +1642,25 @@ class SKN:
                     if vertex_type == 2:
                         bs.pad(16)  # tangent, recomputed by game
 
+            # resolve the palette submeshes, so every vertex ends up holding a real influence
+            # index like the ones the other submeshes already hold. A zero weight is left at 0:
+            # its byte is padding and the file does not always keep it inside the table.
+            for submesh_index, palette in palettes.items():
+                submesh = self.submeshes[submesh_index]
+                for i in range(submesh.vertex_start, submesh.vertex_start + submesh.vertex_count):
+                    vertex = self.vertices[i]
+                    influences = []
+                    for j in range(4):
+                        if vertex.weights[j] <= 0:
+                            influences.append(0)
+                        elif vertex.influences[j] < len(palette):
+                            influences.append(palette[vertex.influences[j]])
+                        else:
+                            raise FunnyError(
+                                f'[SKN.read()]: Submesh {submesh.name}: vertex {i} weights on '
+                                f'palette entry {vertex.influences[j]} of {len(palette)}.')
+                    vertex.influences = influences
+
     def write(self, path):
         # write v4 with vertex colors if present, else v1.1 basic
         has_color = any(v.color != None for v in self.vertices)
@@ -1583,7 +1670,9 @@ class SKN:
 
             bs.write_uint32(0x00112233)  # magic
 
-            if not has_color:
+            # a skinning palette block only exists on major 4, so a mesh that needs one is written
+            # as v4 even with no vertex colours
+            if not has_color and not self.skinning_block:
                 bs.write_uint16(1, 1)  # major, minor
                 bs.write_uint32(len(self.submeshes))
                 for submesh in self.submeshes:
@@ -1594,7 +1683,7 @@ class SKN:
                 bs.write_uint16(*self.indices)
                 for vertex in self.vertices:
                     bs.write_vec3(vertex.position)
-                    bs.write_bytes(vertex.influences)
+                    bs.write_bytes(bytes(vertex.influences))
                     bs.write_float(*vertex.weights)
                     bs.write_vec3(vertex.normal)
                     bs.write_vec2(vertex.uv)
@@ -1606,10 +1695,13 @@ class SKN:
                 bs.write_padded_ascii(64, submesh.name)
                 bs.write_uint32(
                     submesh.vertex_start, submesh.vertex_count, submesh.index_start, submesh.index_count)
-            bs.write_uint32(0)  # flags
+            # flags bit 0: the skinning palette block below. Bit 1 (submesh relative indices) is
+            # never set: the indices written here are absolute and both forms are legal.
+            bs.write_uint32(1 if self.skinning_block else 0)
             bs.write_uint32(len(self.indices), len(self.vertices))
-            bs.write_uint32(56)  # vertex size (color layout)
-            bs.write_uint32(1)  # vertex type: 1 = color
+            # 0 = basic, 1 = color
+            bs.write_uint32(56 if has_color else 52)  # vertex size
+            bs.write_uint32(1 if has_color else 0)  # vertex type
 
             # bounding box + sphere
             bb_min, bb_max = self.bounding_box()
@@ -1621,16 +1713,23 @@ class SKN:
             bs.write_vec3(central)
             bs.write_float(radius)
 
+            # skinning palettes sit between the header and the index buffer
+            if self.skinning_block:
+                bs.write_uint16(len(self.skinning_block))
+                bs.write_bytes(self.skinning_block)
+
             bs.write_uint16(*self.indices)
 
             white = bytes([255, 255, 255, 255])
             for vertex in self.vertices:
                 bs.write_vec3(vertex.position)
-                bs.write_bytes(vertex.influences)
+                bs.write_bytes(bytes(vertex.influences))
                 bs.write_float(*vertex.weights)
                 bs.write_vec3(vertex.normal)
                 bs.write_vec2(vertex.uv)
-                bs.write_bytes(vertex.color if vertex.color != None else white)
+                if has_color:
+                    bs.write_bytes(
+                        vertex.color if vertex.color != None else white)
 
             # THE 12-BYTE END TAB. Every real v4 .skn ends with twelve zero bytes after the
             # vertex buffer - checked on riven_skin23.skn, riven_skin23_spell2_demon.skn and
@@ -1652,6 +1751,45 @@ class SKN:
             if p.y > bb_max.y: bb_max.y = p.y
             if p.z > bb_max.z: bb_max.z = p.z
         return bb_min, bb_max
+
+    @staticmethod
+    def bind_weights(skin_cluster, mesh_dagpath, skl, vertices):
+        # EVERY influence goes in the mask, not just the ones this mesh uses.
+        # `skinCluster -tsb` binds with weights of its own, and setWeights() only writes the
+        # influences the mask names - so a mask holding the used subset leaves those bind weights
+        # sitting on every other joint, and vertices come out with 5+ influences, which export
+        # then refuses. The full mask overwrites all of them, zeros included.
+        influence_count = len(skl.influences)
+
+        # influenceObjects() is in the skin cluster's own order, not the skl's. Matched through a
+        # dict of full dag paths instead of comparing every pair, which was quadratic on the
+        # influence count and ran once per submesh: ~1M MDagPath comparisons through the Python
+        # API on janna skin67, for the same answer.
+        influences_dagpath = MDagPathArray()
+        skin_cluster.influenceObjects(influences_dagpath)
+        physical_index = {}
+        for j in range(influences_dagpath.length()):
+            physical_index[influences_dagpath[j].fullPathName()] = j
+
+        mask_influence = MIntArray(influence_count)
+        for i in range(influence_count):
+            dagpath = skl.joints[skl.influences[i]].dagpath
+            mask_influence[i] = physical_index[dagpath.fullPathName()]
+
+        weights = MDoubleArray(len(vertices) * influence_count)
+        for i in range(len(vertices)):
+            vertex = vertices[i]
+            base = i * influence_count
+            for j in range(4):
+                weight = vertex.weights[j]
+                if weight > 0:
+                    weights[base + vertex.influences[j]] = weight
+
+        component = MFnSingleIndexedComponent()
+        # empty vertex_component = all vertices
+        vertex_component = component.create(MFn.kMeshVertComponent)
+        skin_cluster.setWeights(
+            mesh_dagpath, vertex_component, mask_influence, weights, False)
 
     @staticmethod
     def apply_vertex_colors(mesh, vertices):
@@ -1740,7 +1878,6 @@ class SKN:
             MGlobal.executeCommand(execmd)
 
             if skl != None:
-                influence_count = len(skl.influences)
                 mesh_dagpath = MDagPath()
                 mesh.getPath(mesh_dagpath)
 
@@ -1762,33 +1899,11 @@ class SKN:
                 skin_cluster = MFnSkinCluster(plugs[0].node())
                 skin_cluster_name = skin_cluster.name()
 
-                # mask influence
-                influences_dagpath = MDagPathArray()
-                skin_cluster.influenceObjects(influences_dagpath)
-                mask_influence = MIntArray(influence_count)
-                for i in range(influence_count):
-                    dagpath = skl.joints[skl.influences[i]].dagpath
-                    match_j = next(j for j in range(influence_count)
-                                   if dagpath == influences_dagpath[j])
-                    if match_j != None:
-                        mask_influence[i] = match_j
-
                 # weights
                 MGlobal.executeCommand(
                     f'setAttr {skin_cluster_name}.normalizeWeights 0')
-                component = MFnSingleIndexedComponent()
-                # empty vertex_component = all vertices
-                vertex_component = component.create(MFn.kMeshVertComponent)
-                weights = MDoubleArray(vertex_count * influence_count)
-                for i in range(vertex_count):
-                    vertex = self.vertices[i]
-                    for j in range(4):
-                        weight = vertex.weights[j]
-                        influence = vertex.influences[j]
-                        if weight > 0:
-                            weights[i * influence_count + influence] = weight
-                skin_cluster.setWeights(
-                    mesh_dagpath, vertex_component, mask_influence, weights, False)
+                SKN.bind_weights(
+                    skin_cluster, mesh_dagpath, skl, self.vertices)
                 MGlobal.executeCommand((
                     f'setAttr {skin_cluster_name}.normalizeWeights 1;'
                     f'skinPercent -normalize true {skin_cluster_name} {mesh_name};'
@@ -1896,7 +2011,6 @@ class SKN:
                     # get mesh base on shader
                     mesh = shader_meshes[shader_index]
                     mesh_name = mesh.name()
-                    influence_count = len(skl.influences)
                     mesh_dagpath = MDagPath()
                     mesh.getPath(mesh_dagpath)
 
@@ -1919,34 +2033,12 @@ class SKN:
                         plugs[0].node())
                     skin_cluster_name = skin_cluster.name()
 
-                    # mask influence
-                    influences_dagpath = MDagPathArray()
-                    skin_cluster.influenceObjects(influences_dagpath)
-                    mask_influence = MIntArray(influence_count)
-                    for i in range(influence_count):
-                        dagpath = skl.joints[skl.influences[i]].dagpath
-                        match_j = next(j for j in range(
-                            influence_count) if dagpath == influences_dagpath[j])
-                        if match_j != None:
-                            mask_influence[i] = match_j
-
                     # weights
                     MGlobal.executeCommand(
                         f'setAttr {skin_cluster_name}.normalizeWeights 0')
-                    component = MFnSingleIndexedComponent()
-                    vertex_component = component.create(MFn.kMeshVertComponent)
-                    vertex_count = len(shader_vertices[shader_index])
-                    weights = MDoubleArray(vertex_count * influence_count)
-                    for i in range(vertex_count):
-                        vertex = shader_vertices[shader_index][i]
-                        for j in range(4):
-                            weight = vertex.weights[j]
-                            influence = vertex.influences[j]
-                            if weight > 0:
-                                weights[i * influence_count +
-                                        influence] = weight
-                    skin_cluster.setWeights(
-                        mesh_dagpath, vertex_component, mask_influence, weights, False)
+                    SKN.bind_weights(
+                        skin_cluster, mesh_dagpath, skl,
+                        shader_vertices[shader_index])
                     MGlobal.executeCommand((
                         f'setAttr {skin_cluster_name}.normalizeWeights 1;'
                         f'skinPercent -normalize true {skin_cluster_name} {mesh_name}'
@@ -1961,6 +2053,77 @@ class SKN:
             load_separated()
         else:
             load_combined()
+
+    def pack_influences(self, skl):
+        # build influence table: per-vertex bytes index into it, so up to 256
+        # bound joints even though the skl holds up to 65535 joints
+        used_joints = set()
+        for vertex in self.vertices:
+            for j in range(4):
+                if vertex.weights[j] > 0:
+                    used_joints.add(vertex.influences[j])
+
+        influences = sorted(used_joints)
+        influence_count = len(influences)
+        joint_to_influence = {joint: i for i, joint in enumerate(influences)}
+        skl.influences = influences
+
+        # past 256 bound joints a vertex's single influence byte can no longer name the joint, so
+        # the file gives each affected submesh its own palette: the byte indexes the palette and
+        # the palette holds the real uint16 influence. This is what SKN.read() resolves on the way
+        # in, written back out here. Riot ships it on janna skin67 (297 influences, palettes on
+        # Skirt, Metal03 and Wing) and the format was read off that file.
+        # layout: uint16 block size, then records of
+        #   uint8 submesh index, high bit set on the last record
+        #   uint8 entry count
+        #   uint16 entry * count
+        # Only submeshes that actually need one get one, so anything under 256 bound joints still
+        # writes the same plain flags-0 file it always did.
+        self.skinning_block = b''
+        palette_remaps = {}
+        if influence_count > 256:
+            block = bytearray()
+            last_record = None
+            for order, submesh in enumerate(self.submeshes):
+                used = sorted({
+                    joint_to_influence[self.vertices[i].influences[j]]
+                    for i in range(submesh.vertex_start, submesh.vertex_start + submesh.vertex_count)
+                    for j in range(4)
+                    if self.vertices[i].weights[j] > 0
+                })
+                if not used or used[-1] < 256:
+                    continue
+                # the entry count is one byte and 0 means no record, so 255 entries is the ceiling
+                if len(used) > 255:
+                    raise FunnyError(
+                        f'[SKN.dump()]: Material {submesh.name} is weighted to {len(used)} joints '
+                        'and the skin has more than 256 bound joints in total, max allowed in that '
+                        'case: 255 joints per material.\nSplit the material, or unbind joints it '
+                        'does not need.')
+                palette_remaps[order] = {
+                    influence: slot for slot, influence in enumerate(used)}
+                last_record = len(block)
+                block.append(order)
+                block.append(len(used))
+                for influence in used:
+                    block.extend(Struct('H').pack(influence))
+            if last_record != None:
+                block[last_record] |= 128  # terminator on the last record
+                self.skinning_block = bytes(block)
+
+        for order, submesh in enumerate(self.submeshes):
+            remap = palette_remaps.get(order)
+            for i in range(submesh.vertex_start, submesh.vertex_start + submesh.vertex_count):
+                vertex = self.vertices[i]
+                new_influences = []
+                for j in range(4):
+                    if vertex.weights[j] <= 0:
+                        new_influences.append(0)
+                        continue
+                    influence = joint_to_influence[vertex.influences[j]]
+                    new_influences.append(
+                        remap[influence] if remap != None else influence)
+                vertex.influences = bytes(new_influences)
 
     def dump(self, skl, riot=None):
         def dump_mesh(mesh):
@@ -2426,28 +2589,7 @@ class SKN:
             # assign new list
             self.submeshes = new_submeshes
 
-        # build influence table: per-vertex bytes index into it, so up to 256
-        # bound joints even though the skl holds up to 65535 joints
-        used_joints = set()
-        for vertex in self.vertices:
-            for j in range(4):
-                if vertex.weights[j] > 0:
-                    used_joints.add(vertex.influences[j])
-
-        influences = sorted(used_joints)
-        influence_count = len(influences)
-        if influence_count > 256:
-            raise FunnyError(
-                f'[SKN.dump()]: Too many bound joints found: {influence_count}, max allowed: 256 bound joints.\n'
-                'A skl may hold up to 65535 joints, but only 256 can be bound (have skin weights) at once.')
-
-        joint_to_influence = {joint: i for i, joint in enumerate(influences)}
-        for vertex in self.vertices:
-            vertex.influences = bytes(
-                joint_to_influence[vertex.influences[j]] if vertex.weights[j] > 0 else 0
-                for j in range(4)
-            )
-        skl.influences = influences
+        self.pack_influences(skl)
 
         # check limit vertices
         vertices_count = len(self.vertices)
@@ -2948,17 +3090,18 @@ class ANM:
         MGlobal.executeCommand(
             f'currentTime 0;setKeyframe -breakdown 0 -hierarchy none -controlPoints 0 -shape 0 -at translateX -at translateY -at translateZ -at scaleX -at scaleY -at scaleZ -at rotateX -at rotateY -at rotateZ {joint_names};')
 
-        # get global times
-        times = []
-        for track in scene_tracks:
-            for time in track.poses:
-                if time not in times:
-                    times.append(time)
-        # fill gloal times
-        for track in scene_tracks:
-            for time in times:
-                if time not in track.poses:
-                    track.poses[time] = None
+        # get global times, SORTED
+        # the curves below are filled by walking this list, and MFnAnimCurve.addKeys() wants its
+        # keys in increasing time order. A compressed (r3d2canm) anm gives every joint its OWN
+        # sparse set of times, so collecting them in track order produced a jumbled list: the
+        # first track's keys came out in order by luck and every other joint got a broken curve.
+        # That is the "only the root moves" bug. An uncompressed anm hides it - every track shares
+        # one dense set of times, so the list was already sorted.
+        times = sorted({
+            time
+            for track in scene_tracks
+            for time in track.poses
+        })
         # MTime instance at time  (dict comp)
         mtimes = {time: MTime(current + time * self.fps + 1, ui_unit)
                   for time in times}
@@ -2966,7 +3109,8 @@ class ANM:
         # build curve data
         for time in times:
             for track in scene_tracks:
-                pose = track.poses[time]
+                # a track only has the times it was keyed at, the rest are simply absent
+                pose = track.poses.get(time)
                 if pose != None:
                     mtime = mtimes[time]
                     if pose.translation != None:
@@ -3002,6 +3146,17 @@ class ANM:
             dep = MFnDependencyNode(joint_node)
 
             for attr in attributes:
+                # SKIP AN EMPTY CHANNEL. A compressed (r3d2canm) anm keys translation, rotation
+                # and scale separately, so a joint routinely has rotation keys and no scale keys
+                # at all - 353 of janna skin67's 361 tracks have at least one empty channel, Root
+                # included. addKeys() on an empty array raises "(kFailure): Unexpected Internal
+                # Failure", which killed the whole loop on its FIRST joint: Root kept the keys it
+                # had already been given and every other joint was left with nothing but the
+                # frame-0 baseline. That is the "only the root moves" bug. An uncompressed anm
+                # writes all three channels on every pose, so no array is ever empty there, which
+                # is why this only ever showed up on compressed files.
+                if track.curve_times[attr].length() == 0:
+                    continue
                 # plug=node.attribute: example: tx_plug=Root.tX
                 attr_plug = dep.findPlug(attr)
                 # get/create curve for this attribute
